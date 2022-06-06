@@ -1,0 +1,133 @@
+---
+title: "OCR_v2"
+author: "Adam Kaderabek"
+date: "12/29/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(image.binarization)
+library(magick)
+library(stringi)
+library(stringr)
+library(tesseract)
+library(tictoc)
+library(tidyr)
+library(xlsx)
+```
+
+# Data Parsing
+
+```{r}
+# load list of units
+load("Dictionary Data/dict_units.RData")
+# load unit extract regex
+load("Dictionary Data/dict_extract_units.RData")
+# load garbage line-control regex
+load("Dictionary Data/dict_garbage_line_controls2.RData")
+# load in-line garbage control regex
+load("Dictionary Data/dict_garbage_inline_controls.RData")
+
+# List of store dept headers; e.g., "MEAT", "DAIRY", etc.
+load("Dictionary Data/dict_headers_line_controls2.RData")
+
+FAH4OCR<-paste("K:/Research/Umich_West/2020 Receipt Validation/TesseractOCR/03 FAH Processed/Cropped/All/", # Paste root path
+               list.files("K:/Research/Umich_West/2020 Receipt Validation/TesseractOCR/03 FAH Processed/Cropped/All/"), sep="") # and individual file names for input
+
+FAH.OCROut<-paste("K:/Research/Umich_West/2020 Receipt Validation/TesseractOCR/03 FAH Processed/Receipts/Third Pass/", # Paste root path
+                  list.files("K:/Research/Umich_West/2020 Receipt Validation/TesseractOCR/03 FAH Processed/Cropped/All/"), sep="") # and individual file names for output
+FAH.OCROut<-str_replace(FAH.OCROut, ".jpg|.JPG|.png|.PNG", ".xlsx")
+
+```
+
+```{r}
+# i<-6 # hard-set indicator for testing loop entries
+
+for (i in 1:length(FAH4OCR)) { # for each receipt image in folder
+  tic("start")
+  # import image file i
+  image.scan<-image_read(FAH4OCR[i])
+  # scan image file i
+  image.text<-image_ocr(image.scan)
+  # un-list image text by line
+  image.lines<-data.frame(EventID=str_extract(FAH4OCR[i], "[0-9]+(?=_)"), 
+                          OLID=1:length(unlist(str_split(image.text, "\n"))),
+                          OCRLines=unlist(str_split(image.text, "\n")))
+  # Convert all characters to UPPER case
+  image.lines$OCRLines2<-str_to_upper(image.lines$OCRLines)
+  # replace any commas (,) as period/decimal point (.)
+  image.lines$OCRLines2<-str_replace_all(image.lines$OCRLines2, pattern = ",", replacement = ".")
+  # remove all special characters except -, ., /, and @
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex("[^A-Z0-9\\s\\.@/-]"))
+  # remove errant hyphens from front of strings
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex("^\\s*-"))
+  # remove single letters surrounded by white space 
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex("(?<![\\S])[:alpha:]{1}(?![\\S])"))
+  # remove sequences of X's
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex("X{2,}",))
+  # remove garbage at the end of a discount string
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex("(?<=\\.\\d\\d-).*$"))
+  # remove garbage at the end of an item string following a price
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex("(?<=\\.[0-9]{2})[A-Z\\s]+$|(?<=\\.[0-9]{2})\\s*0"))
+  
+  # remove any long string of digits (five or more) from line 
+  image.lines$OCRLines2<-str_remove(image.lines$OCRLines2, "[0-9]{4,}")
+  # remove any whitespace from end of line 
+  image.lines$OCRLines2<-str_remove(image.lines$OCRLines2, "\\s+$")
+  # remove any special characters other than "-" for discounts
+  image.lines$OCRLines2<-str_remove(image.lines$OCRLines2, "[^A-Z0-9-]+$")
+  # replace duplicated white spaces with a single space
+  image.lines$OCRLines2<-str_replace_all(image.lines$OCRLines2, "\\s{2,}", " ") 
+  # remove lines serving as dept headers, e.g. meat, produce, etc.
+  image.lines$OCRLines2<-str_remove_all(image.lines$OCRLines2, regex(paste(headers, collapse = "|")))
+  # identify garbage lines and replace as empty line[l]
+  image.lines$OCRLines2<-ifelse(str_detect(image.lines$OCRLines2, regex(paste(garbageline, collapse = "|")))==TRUE, "", image.lines$OCRLines2)
+  # create quantity indicator
+  image.lines$isQuantity<-ifelse(str_detect(image.lines$OCRLines2, regex("@"))==TRUE, 1 ,0)
+  # create discount indicator
+  image.lines$isDiscount<-ifelse(str_detect(image.lines$OCRLines2, regex("(?<=-)\\s?\\d{0,2}\\s?\\.\\d{2}|\\d{0,2}\\s*\\.\\d{2}(?=.{0,1}-)"))==TRUE, 1 ,0)
+  # remove all "-"s
+  image.lines$OCRLines2<-str_remove(image.lines$OCRLines2, "-")
+  # extract price patterns
+  image.lines$amount<-str_extract(image.lines$OCRLines2, "(?<=\\s?)\\d{0,2}\\s?\\.\\d{2}$|\\d{0,2}\\s*\\.\\d{2}$(?=.{0,1})")
+  # remove price patterns
+  image.lines$OCRLines2<-str_remove(image.lines$OCRLines2, "(?<=\\s?)\\d{0,2}\\s?\\.\\d{2}$|\\d{0,2}\\s*\\.\\d{2}$(?=.{0,1})")
+  # remove spaces from prices
+  image.lines$amount<-str_remove(image.lines$amount, "\\s")
+  # create "TOTAL" indicator
+  image.lines$isRecTotal<-ifelse(str_detect(image.lines$OCRLines2, regex("TOTAL|BALANCE"))==TRUE & !is.na(image.lines$amount), 1 ,0)
+  
+  # replace whitespace lines with NA
+  image.lines$OCRLines2<-str_replace(image.lines$OCRLines2, "^\\s*$", "NA")
+  image.lines$OCRLines2<-ifelse(image.lines$OCRLines2=="NA", NA, image.lines$OCRLines2)
+  
+  # subset rows to only those with data other than item name
+  receipt_df<-subset(image.lines, !is.na(OCRLines2)); receipt_df
+  receipt_df$OLID<-seq(1:nrow(receipt_df))
+  
+  receipt_df<-receipt_df %>%
+    select(EventID, OLID, OCRLines, OCRLines2, amount, isQuantity, isDiscount, isRecTotal)
+  
+  # write out xlsx/csv
+  write.xlsx(receipt_df, file = FAH.OCROut[i], row.names = FALSE)
+  # write.csv(receipt, file = FAH.OCROut[i], row.names = FALSE)
+  print(receipt_df)
+  toc()
+}
+
+
+```
+
+## Regex Testing
+```{r}
+strings<-c("TS SWEET 001800042742 F =—s_- 3.87 0", "-1.00", "1.00-", "- 1.00", "- .56", "1.25 -", ".25 -", "BREAD 007874298199 F = =—ss« 1.00 0", "GOLDEN GRHM 001600027516 F 2.98 0", "2.02 lb @ 1 lb /0.62 1.05 N", "1 @ 2/6.00 N ", "1@2/6.00", "8463841384618 2.8/3" )
+
+str_view_all(image.lines$OCRLines2, "^\\s+$")
+
+
+regex("[^A-Za-z0-9$\\s\\.@/-]|-(?=[^A-Za-z0-9\\s])|(?<=[^A-Za-z0-9\\s])-\\s|(?<!@.{1,9})/", ignore_case = TRUE)# remove special characters with hyphens unless they are close to a number. Keep "/" if line contains preceding "@"
+```
